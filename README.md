@@ -1,3 +1,9 @@
+
+
+### Info
+
+Updates to the upstream project adding database for Cache. Currently supporting MySQL database. Project development is taking place in [sergueik/springboot_study/basic-go-mysql](https://github.com/sergueik/springboot_study/tree/master/basic-go-mysql)
+
 # Grafana RRD Server
 
 A simple HTTP server that reads RRD files and responds to requests from Grafana with [Grafana Simple JSON Datasource plugin](https://grafana.net/plugins/grafana-simple-json-datasource).

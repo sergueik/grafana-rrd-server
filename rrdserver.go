@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"gopkg.in/yaml.v2"
+	"io/ioutil"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,9 +19,27 @@ import (
 	"github.com/gocarina/gocsv"
 	"github.com/mattn/go-zglob"
 	"github.com/ziutek/rrd"
+
+	"database/sql"
+	_ "github.com/go-sql-driver/mysql"
 )
 
-var config Config
+type Tag struct {
+	ID   int  `json:"id"`
+ 	Fname string `json:"fname"`
+ 	Ds string `json:"ds"`
+}
+var  (
+	buildCache bool = false 
+	legacyCache bool = false
+	config Config
+	configFile string
+	appConfig AppConfig
+	dbConfig DbConfig
+	folderConfig FolderScan
+	rejectFlag string
+	collectFlag string
+)
 
 type QueryResponse struct {
 	Target     string      `json:"target"`
@@ -103,6 +123,37 @@ type ServerConfig struct {
 	Multiplier         int
 }
 
+type DbConfig struct {
+	User     string
+	Password string
+	Database string
+	Table    string
+	Server   string
+	Port     int
+}
+
+type FolderScan struct {
+	Collect []string `yaml:"collect"`
+	Reject  []string `yaml:"reject"`
+}
+
+type AppConfig struct {
+	Database DbConfig `yaml:"database"`
+	Folders FolderScan `yaml:"folders"`
+}
+
+func (c *AppConfig) getConf(configFile string) *AppConfig {
+    if _, err := os.Stat(configFile); err == nil {
+      yamlFile, err := ioutil.ReadFile(configFile)
+      if err != nil { panic(err.Error()) }
+      err = yaml.Unmarshal(yamlFile, &c)
+      if err != nil { panic(err.Error()) }
+      return c
+    } else {
+      return nil
+    }
+}
+
 type ErrorResponse struct {
 	Message string `json:"message"`
 }
@@ -116,28 +167,91 @@ func NewSearchCache() *SearchCache {
 	return &SearchCache{}
 }
 
-func (w *SearchCache) Get() []string {
-	w.m.Lock()
-	defer w.m.Unlock()
+func (w *SearchCache) Get(target string) []string {
+	newItems := []string{}
+  if legacyCache { 
+    // support legacy flag
+    w.m.Lock()
+    defer w.m.Unlock()
+    return w.items
+  } else {
+    db, err := sql.Open("mysql", dbConfig.User + ":" + dbConfig.Password + "@tcp(" + dbConfig.Server + ":" +  strconv.Itoa(dbConfig.Port)  +  ")/" + dbConfig.Database )
 
-	return w.items
+    if err != nil { panic(err.Error()) }
+    defer db.Close()
+    var query string
+    
+    if target != "" {
+      query = "SELECT DISTINCT fname,ds FROM " + dbConfig.Table + " WHERE fname = ?"
+    } else { 
+      query = "SELECT DISTINCT fname,ds FROM " + dbConfig.Table 
+    }
+    fmt.Println("querying the " + dbConfig.Table + " table: " + query)
+
+    rows, err := db.Query(query, target)
+    if err != nil { panic(err.Error()) }
+    for rows.Next() {
+      var tag Tag
+      err = rows.Scan(&tag.Fname,&tag.Ds)
+      if err != nil { panic(err.Error()) }
+      fmt.Println("item: " + tag.Fname + ":" + tag.Ds)
+      newItems = append(newItems, tag.Fname + ":" + tag.Ds)
+    }
+    defer db.Close()
+    return newItems
+  }
 }
 
+// https://ispycode.com/GO/Collections/Arrays/Check-if-item-is-in-array
+func contains(a []string, e string) bool {
+	for _, t := range a {
+		if t == e {
+			return true
+		}
+	}
+	return false
+}
+
+func lacks(a []string, e string) bool {
+	if len(a) == 0 {
+		return false
+	}
+	for _, t := range a {
+		if t == e {
+			return false
+		}
+	}
+	return true
+}
 func (w *SearchCache) Update() {
 	newItems := []string{}
 
 	fmt.Println("Updating search cache.")
-	err := filepath.Walk(strings.TrimRight(config.Server.RrdPath, "/")+"/",
+	db, err := sql.Open("mysql", dbConfig.User + ":" + dbConfig.Password + "@tcp(" + dbConfig.Server + ":" +  strconv.Itoa(dbConfig.Port)  +  ")/" + dbConfig.Database )
+
+	if err != nil { panic(err.Error()) }
+	fmt.Println("Connected to database.")
+
+	err = filepath.Walk(strings.TrimRight(config.Server.RrdPath, "/") + "/",
+		// https://pkg.go.dev/path/filepath#WalkFunc
 		func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
-
-			if info.IsDir() || !strings.Contains(info.Name(), ".rrd") {
+			if info.IsDir() {
+				if contains(folderConfig.Reject,info.Name()) || lacks(folderConfig.Collect, info.Name()) { 
+					fmt.Println("Skip directory: " + info.Name())
+					return filepath.SkipDir
+				} else { 
+					return nil
+				}
+			}
+			if !strings.Contains(info.Name(), ".rrd") {
 				return nil
 			}
 			rel, _ := filepath.Rel(config.Server.RrdPath, path)
 			fName := strings.Replace(rel, ".rrd", "", 1)
+			// convert to Apple III/ MacOS style path separators
 			fName = strings.Replace(fName, "/", ":", -1)
 
 			infoRes, err := rrd.Info(path)
@@ -145,10 +259,25 @@ func (w *SearchCache) Update() {
 				fmt.Println("ERROR: Cannot retrieve information from ", path)
 				fmt.Println(err)
 			}
-			for ds, _ := range infoRes["ds.index"].(map[string]interface{}) {
-				newItems = append(newItems, fName+":"+ds)
+			if ! legacyCache {
+				// perform a db.Query delete
+				fmt.Println("Delete from database:" + "\"" + fName + "\"")
+				op, err := db.Query("DELETE FROM `" + dbConfig.Table + "` WHERE fname = ?", fName )
+				if err != nil { panic(err.Error()) }
+				defer op.Close()
 			}
+			for ds, _ := range infoRes["ds.index"].(map[string]interface{}) {
+				if legacyCache {
+					newItems = append(newItems, fName+":"+ds)
+				} else {
+					// perform a db.Query insert
+					fmt.Println("Inserted into database:" + "\"" + fName + ":" + ds + "\"")
+					insert, err := db.Query("INSERT INTO `" + dbConfig.Table + "` (ins_date, fname, ds) VALUES ( now(), ?,  ? )", fName, ds)
 
+					if err != nil { panic(err.Error()) }
+					defer insert.Close()
+				}
+			}
 			return nil
 		})
 
@@ -160,7 +289,10 @@ func (w *SearchCache) Update() {
 	w.m.Lock()
 	defer w.m.Unlock()
 	w.items = newItems
+	defer db.Close()
+	fmt.Println("Closed database connection.")
 	fmt.Println("Finished updating search cache.")
+
 }
 
 var searchCache *SearchCache = NewSearchCache()
@@ -194,11 +326,12 @@ func search(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	target := searchRequest.Target
+	fmt.Printf("Target: %s\n", target)
 
 	var result = []string{}
 
 	if target != "" {
-		for _, path := range searchCache.Get() {
+		for _, path := range searchCache.Get(target) {
 			if strings.Contains(path, target) {
 				result = append(result, path)
 			}
@@ -277,7 +410,7 @@ func query(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	respondJSON(w, result)
-}
+} 
 
 func annotations(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "OPTIONS" {
@@ -327,6 +460,34 @@ func annotations(w http.ResponseWriter, r *http.Request) {
 }
 
 func SetArgs() {
+  
+	// to get help about accepted arg pass an invalid one e.g. -h
+	flag.StringVar(&configFile, "f", "config.yaml", "Config File.")
+	// NOTE: order is intentionally incorrect here: 
+	// configFile value is still the default one
+	appConfig.getConf(configFile)
+	dbConfig = appConfig.Database
+	fmt.Println("database config:" + "\n" + "User: " + dbConfig.User + "\n" + "Database: " + dbConfig.Database + "\n" + "Server: " + dbConfig.Server + "\n" + "Table: " + dbConfig.Table + "\n" + "Port: " + strconv.Itoa(dbConfig.Port) + "\n" )
+
+	folderConfig = appConfig.Folders
+	fmt.Println("folder scan config:")
+	fmt.Println("collect:")
+	for _, v := range folderConfig.Collect {
+		fmt.Println(v)
+	}
+	fmt.Println("reject:")
+
+	for _, v := range folderConfig.Reject {
+		fmt.Println(v)
+	}
+
+	flag.StringVar(&dbConfig.User, "u", "java", "DB User.")
+	flag.StringVar(&dbConfig.Password, "v", "password", "DB User Password.")
+	flag.StringVar(&dbConfig.Database, "w", "test", "Database.")
+	flag.StringVar(&dbConfig.Server, "x", "mysql-server", "DB Server.")
+ 	flag.IntVar(&dbConfig.Port, "y", 3306, "DB Server port.")
+ 
+	flag.StringVar(&dbConfig.Table, "z", "cache_table", "Table.")
 	flag.StringVar(&config.Server.IpAddr, "i", "", "Network interface IP address to listen on. (default: any)")
 	flag.IntVar(&config.Server.Port, "p", 9000, "Server port.")
 	flag.StringVar(&config.Server.RrdPath, "r", "./sample/", "Path for a directory that keeps RRD files.")
@@ -334,27 +495,56 @@ func SetArgs() {
 	flag.Int64Var(&config.Server.SearchCache, "c", 600, "Search cache in seconds.")
 	flag.StringVar(&config.Server.AnnotationFilePath, "a", "", "Path for a file that has annotations.")
 	flag.IntVar(&config.Server.Multiplier, "m", 1, "Value multiplier.")
+	flag.BoolVar(&buildCache, "update", false, "update cache")
+	_ = buildCache
+	flag.BoolVar(&legacyCache, "legacy", false, "use legacy cache")
+	_ = legacyCache
+	// NOTE: default values for collect and reject flags are blank
+	flag.StringVar(&collectFlag, "collect", "", "Folders to collect.")
+	flag.StringVar(&rejectFlag, "reject", "", "Folders to reject.")
 	flag.Parse()
+	fmt.Println("User: " + dbConfig.User + "\n" + "Database: " + dbConfig.Database + "\n" + "Server: " + dbConfig.Server + "\n" + "Table: " + dbConfig.Table + "\n" + "Port: " + strconv.Itoa(dbConfig.Port) + "\n" )
+	fmt.Println("folder scan config:")
+	fmt.Println("collectFlag: " + collectFlag)
+	fmt.Println("collect:")
+	if len(collectFlag) == 0 {
+		folderConfig.Collect = []string{}
+		fmt.Println("none")
+	} else {
+		folderConfig.Collect = strings.Split(collectFlag, ",")
+		for _, v := range folderConfig.Collect {
+			fmt.Println(v)
+		}
+	}
+	fmt.Println("rejectFlag: " + rejectFlag)
+	fmt.Println("reject:")
+	if len(rejectFlag ) == 0 {
+		folderConfig.Reject = []string{}
+		fmt.Println("none")
+	} else {
+		folderConfig.Reject = strings.Split(rejectFlag, ",")
+		for _, v := range folderConfig.Reject {
+			fmt.Println(v)
+		}
+	}
+
 }
 
 func main() {
 	SetArgs()
-
-	http.HandleFunc("/search", search)
-	http.HandleFunc("/query", query)
-	http.HandleFunc("/annotations", annotations)
-	http.HandleFunc("/", hello)
-
-	go func() {
-		for {
-			searchCache.Update()
-			time.Sleep(time.Duration(config.Server.SearchCache) * time.Second)
+	if (buildCache) { 
+		searchCache.Update()
+		return
+	} else {
+		http.HandleFunc("/search", search)
+		http.HandleFunc("/query", query)
+		http.HandleFunc("/annotations", annotations)
+		http.HandleFunc("/", hello)
+		err := http.ListenAndServe(config.Server.IpAddr+":"+strconv.Itoa(config.Server.Port), nil)
+		if err != nil {
+			fmt.Println("ERROR:", err)
+			os.Exit(1)
 		}
-	}()
-
-	err := http.ListenAndServe(config.Server.IpAddr+":"+strconv.Itoa(config.Server.Port), nil)
-	if err != nil {
-		fmt.Println("ERROR:", err)
-		os.Exit(1)
 	}
 }
+

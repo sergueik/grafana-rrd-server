@@ -33,6 +33,9 @@ type Tag struct {
 var  (
 	buildCache bool = false
 	legacyCache bool = false
+	param string = "param"
+	data string = ""
+	debug bool = false
 	verbose bool = false
 	config Config
 	configFile string
@@ -181,14 +184,28 @@ func (w *SearchCache) Get(target string) []string {
 		if err != nil { panic(err.Error()) }
 		defer db.Close()
 		var query string
-		var rows *sql.Rows
+		var rows *sql.Rows = &sql.Rows {}
 
 		if target != "" {
-			query = "SELECT DISTINCT fname,ds FROM " + dbConfig.Table + " WHERE fname = ?"
+			query = "SELECT DISTINCT fname,ds FROM " + dbConfig.Table + " WHERE fname = ? ORDER BY fname"
+			if verbose {
+				fmt.Println("query: " + query)
+			}
 			rows, err = db.Query(query, target)
 		} else {
-			query = "SELECT DISTINCT fname,ds FROM " + dbConfig.Table
+			if data != "" {
+				query = "SELECT DISTINCT fname,ds FROM " + dbConfig.Table + " WHERE fname LIKE ? ORDER BY fname"
+				if verbose {
+					fmt.Println("query: " + query)
+				}
+				rows, err = db.Query(query, data + "%")
+			} else {
+				query = "SELECT DISTINCT fname,ds FROM " + dbConfig.Table + " ORDER BY fname"
+			if verbose {
+				fmt.Println("query: " + query)
+			}
 			rows, err = db.Query(query)
+			}
 		}
 		if err != nil { panic(err.Error()) }
 		// fmt.Println(reflect.TypeOf(rows))
@@ -202,6 +219,7 @@ func (w *SearchCache) Get(target string) []string {
 			newItems = append(newItems, tag.Fname + ":" + tag.Ds)
 		}
 		defer db.Close()
+		// fmt.Errorf("fname %s not found, ", fname )
 		return newItems
 	}
 }
@@ -245,12 +263,12 @@ func (w *SearchCache) Update() {
 				return err
 			}
 			if info.IsDir() {
-				if contains(folderConfig.Reject,info.Name()) || lacks(folderConfig.Collect, info.Name()) { 
+				if contains(folderConfig.Reject,info.Name()) || lacks(folderConfig.Collect, info.Name()) {
 					if verbose {
           					fmt.Println("Skip directory: " + info.Name())
 					}
 					return filepath.SkipDir
-				} else { 
+				} else {
 					return nil
 				}
 			}
@@ -325,6 +343,12 @@ func respondJSON(w http.ResponseWriter, result interface{}) {
 }
 
 func hello(w http.ResponseWriter, r *http.Request) {
+	if verbose {
+		// TODO: echo header back
+		for k, v := range r.Header {
+			fmt.Printf( "Header field %q, Value %q\n", k, v)
+		}
+	}
 	result := ErrorResponse{Message: "hello"}
 	respondJSON(w, result)
 }
@@ -347,6 +371,11 @@ func search(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("Target: %s\n", target)
 		default:
 			fmt.Fprintf(w, "Sorry, only GET and POST methods are supported.")
+	}
+	var key string = strings.Title(strings.ToLower(param))
+	data = r.Header.Get(key)
+	if verbose {
+		fmt.Println("Got: " + key + " = " + data)
 	}
 	var result = []string{}
 
@@ -428,7 +457,7 @@ func query(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	respondJSON(w, result)
-} 
+}
 
 func annotations(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "OPTIONS" {
@@ -478,10 +507,10 @@ func annotations(w http.ResponseWriter, r *http.Request) {
 }
 
 func SetArgs() {
-  
+
 	// to get help about accepted arg pass an invalid one e.g. -h
 	flag.StringVar(&configFile, "f", "config.yaml", "Config File.")
-	// NOTE: order is intentionally incorrect here: 
+	// NOTE: order is intentionally incorrect here:
 	// configFile value is still the default one
 	appConfig.getConf(configFile)
 	dbConfig = appConfig.Database
@@ -504,7 +533,7 @@ func SetArgs() {
 	flag.StringVar(&dbConfig.Database, "w", "test", "Database.")
 	flag.StringVar(&dbConfig.Server, "x", "mysql-server", "DB Server.")
  	flag.IntVar(&dbConfig.Port, "y", 3306, "DB Server port.")
- 
+
 	flag.StringVar(&dbConfig.Table, "z", "cache_table", "Table.")
 	flag.StringVar(&config.Server.IpAddr, "i", "", "Network interface IP address to listen on. (default: any)")
 	flag.IntVar(&config.Server.Port, "p", 9000, "Server port.")
@@ -518,6 +547,7 @@ func SetArgs() {
 	_ = buildCache
 	flag.BoolVar(&legacyCache, "legacy", false, "use legacy cache")
 	_ = legacyCache
+	flag.StringVar(&param, "param", "param", "Parameter to read from request headers")
 	// NOTE: default values for collect and reject flags are blank
 	flag.StringVar(&collectFlag, "collect", "", "Folders to collect.")
 	flag.StringVar(&rejectFlag, "reject", "", "Folders to reject.")
@@ -551,7 +581,7 @@ func SetArgs() {
 
 func main() {
 	SetArgs()
-	if (buildCache) { 
+	if (buildCache) {
 		searchCache.Update()
 		return
 	} else {

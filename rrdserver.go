@@ -184,6 +184,9 @@ func (w *SearchCache) Get(target string) []string {
 		if err != nil { panic(err.Error()) }
 		defer db.Close()
 		var query string
+		// var rows *sql.Rows
+		// NOTE: no new variables on left side of :=
+                // rows = &sql.Rows {}
 		var rows *sql.Rows = &sql.Rows {}
 
 		if target != "" {
@@ -194,11 +197,11 @@ func (w *SearchCache) Get(target string) []string {
 			rows, err = db.Query(query, target)
 		} else {
 			if data != "" {
-				query = "SELECT DISTINCT fname,ds FROM " + dbConfig.Table + " WHERE fname LIKE ? ORDER BY fname"
+				query = "SELECT DISTINCT fname,ds FROM " + dbConfig.Table + " WHERE expose LIKE ? ORDER BY fname"
 				if verbose {
 					fmt.Println("query: " + query)
 				}
-				rows, err = db.Query(query, data + "%")
+				rows, err = db.Query(query, "%" + data + "%")
 			} else {
 				query = "SELECT DISTINCT fname,ds FROM " + dbConfig.Table + " ORDER BY fname"
 			if verbose {
